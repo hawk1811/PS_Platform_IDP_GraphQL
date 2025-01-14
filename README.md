@@ -337,3 +337,9 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## 📜 License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+📝 Note: If you encounter PowerShell execution policy restrictions, you can run the script using:
+powershell -ExecutionPolicy Bypass -File .\IDP_API_Platform_GraphQL.ps1
+
+For permanent solution, run PowerShell as Administrator and execute:
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
