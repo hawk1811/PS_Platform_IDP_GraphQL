@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env pwsh
+#!/usr/bin/env pwsh
 
 <#
 =============================================================================
@@ -46,85 +46,78 @@ SOFTWARE.
     Requirements: PowerShell 5.1 or higher
 #>
 
-
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory=$false)]
     [string]$API_ID,
-    
-    [Parameter(Mandatory=$false)]
     [string]$API_SECRET,
-    
-    [Parameter(Mandatory=$false)]
-    [ValidateSet('US-1', 'US-2', 'EU-1', 'US-GOV-1')]
+    [ValidateSet('US-1', 'US-2', 'EU-1', 'GOV-1')]
     [string]$REGION,
-
-    # Query Type Selection
-    [Parameter(Mandatory=$false)]
-    [ValidateSet('DomainRisks', 'Entities', 'ServiceAccess')]
-    [string]$QueryType,
-
-    # Service Access Parameters
-    [Parameter(Mandatory=$false)]
-    [string[]]$Protocols,
-    [Parameter(Mandatory=$false)]
-    [string[]]$Services,
-    [Parameter(Mandatory=$false)]
-    [int]$FetchSize = 1000,
-
-    # Domain Risks Parameters
-    [Parameter(Mandatory=$false)]
-    [string]$DomainName,
-    [Parameter(Mandatory=$false)]
-    [int]$RiskScore,
-
-    # Entity Query Parameters
-    [Parameter(Mandatory=$false)]
-    [string]$EntityType,
-    [Parameter(Mandatory=$false)]
-    [string]$SearchQuery,
-
-    # Scheduling Parameters
-    [Parameter(Mandatory=$false)]
-    [ValidatePattern('^(\d+[mhdw])?$')]
-    [string]$Schedule,
-    
-    [Parameter(Mandatory=$false)]
-    [int]$RunLimit = 0
+    [ValidateSet('DomainAssessment', 'EntityQuery', 'ServiceAccess')]
+    [string]$QUERY,
+    [string]$SCHEDULE,
+    [int]$REPEAT = 1,
+    [string[]]$PROTOCOL,
+    [string[]]$SERVICE,
+    [string[]]$DOMAINS,
+    [switch]$HELP
 )
 
-Clear-Host
+# Add custom parameter validation block at the beginning of the script
+$ErrorActionPreference = 'Stop'
 
-#-------------------------------------------------------------------------
-# Get External IP Address
-#-------------------------------------------------------------------------
-function Get-ExternalIPAddress {
-    $ipCheckUrls = @(
-        'https://api.ipify.org',
-        'https://checkip.amazonaws.com',
-        'https://icanhazip.com'
-    )
-    
-    foreach ($url in $ipCheckUrls) {
-        try {
-            $externalIP = Invoke-RestMethod -Uri $url -TimeoutSec 3
-            Write-Log "Successfully retrieved external IP from $url"
-            return $externalIP.Trim()
-        }
-        catch {
-            Write-Log "Failed to fetch IP from $url : $_" -Level Warning
-            continue
-        }
+try {
+    if ($QUERY -eq 'DomainAssessment' -and $args.Count -gt 0) {
+        throw [System.Management.Automation.ValidationMetadataException]::new(
+            "Invalid parameter usage. For DomainAssessment with multiple domains, use the -DOMAINS parameter.`n" +
+            "Example: .\test.ps1 -API_ID 'xxx' -REGION 'US-1' -QUERY 'DomainAssessment' -DOMAINS 'domain1.com','domain2.com'`n" +
+            "Note: Domains should be comma-separated and enclosed in quotes when using the -DOMAINS parameter."
+        )
     }
-    
-    Write-Log "Unable to fetch external IP from any source" -Level Warning
-    return $null
+
+    # Parameter validation
+    $missingParams = @()
+    if ($QUERY -and -not $API_ID) { $missingParams += "API_ID" }
+    if ($PROTOCOL -and $QUERY -ne 'ServiceAccess') {
+        throw [System.Management.Automation.ValidationMetadataException]::new(
+            "Error: PROTOCOL parameter is only valid with ServiceAccess query type.`n" +
+            "Example: .\test.ps1 -API_ID 'xxx' -REGION 'US-1' -QUERY 'ServiceAccess' -PROTOCOL 'NTLM','KERBEROS'"
+        )
+    }
+    if ($SERVICE -and $QUERY -ne 'ServiceAccess') {
+        throw [System.Management.Automation.ValidationMetadataException]::new(
+            "Error: SERVICE parameter is only valid with ServiceAccess query type.`n" +
+            "Example: .\test.ps1 -API_ID 'xxx' -REGION 'US-1' -QUERY 'ServiceAccess' -SERVICE 'WEB','FILE_SHARE'"
+        )
+    }
+    if ($SCHEDULE -and -not $QUERY) {
+        throw [System.Management.Automation.ValidationMetadataException]::new(
+            "Error: SCHEDULE parameter requires a QUERY type.`n" +
+            "Example: .\test.ps1 -API_ID 'xxx' -REGION 'US-1' -QUERY 'DomainAssessment' -SCHEDULE '1h'"
+        )
+    }
+    if ($missingParams.Count -gt 0) {
+        throw [System.Management.Automation.ValidationMetadataException]::new(
+            "Error: The following required parameters are missing: $($missingParams -join ', ')`n" +
+            "Please provide all required parameters to continue."
+        )
+    }
+}
+catch {
+    Write-Log "Parameter validation error: $($_.Exception.Message)" -Level Error
+    exit 1
 }
 
 #-------------------------------------------------------------------------
 # Directory Setup
 #-------------------------------------------------------------------------
-$ScriptDirectory = $PWD.Path
+# Get the directory where the script is located
+$ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Definition
+if (-not $ScriptDirectory) {
+    $ScriptDirectory = $PSScriptRoot
+}
+if (-not $ScriptDirectory) {
+    $ScriptDirectory = (Get-Location).Path
+}
 
 # Create Logs directory if it doesn't exist
 $LogsDirectory = Join-Path -Path $ScriptDirectory -ChildPath "Logs"
@@ -149,9 +142,103 @@ $SERVICE_TYPES = @(
     'GENERIC_CLOUD', 'SERVICE_ACCOUNT', 'UNKNOWN'
 )
 
-$DATA_FETCH_OPTIONS = @(
-    1000, 5000, 10000, 50000, 100000
-)
+#-------------------------------------------------------------------------
+# Help Function
+#-------------------------------------------------------------------------
+function Show-Help {
+    $helpText = @"
+IDP GraphQL API Platform Script Help
+===================================
+
+USAGE:
+    ./script.ps1 [-API_ID <id>] [-API_SECRET <secret>] [-REGION <region>] [-QUERY <query>] 
+                 [-SCHEDULE <schedule>] [-REPEAT <count>] [-PROTOCOL <protocols>] 
+                 [-SERVICE <services>] [-DOMAINS <domains>]
+
+FLAGS:
+    -API_ID        API Client ID for authentication
+    -API_SECRET    API Client Secret for authentication (optional - will prompt if not provided)
+    -REGION        Region selection (US-1, US-2, EU-1, GOV-1)
+    -QUERY         Query type (DomainAssessment, EntityQuery, ServiceAccess)
+    -SCHEDULE      Schedule interval (e.g., 3m, 10h, 2d)
+    -REPEAT        Number of times to repeat scheduled execution
+    -PROTOCOL      Protocol types for ServiceAccess (comma-separated list)
+    -SERVICE       Service types for ServiceAccess (comma-separated list)
+    -DOMAINS       Target domains for DomainAssessment (comma-separated list)
+    -HELP          Display this help message
+
+QUERY TYPES:
+    DomainAssessment: Assess domain security
+        Usage: -QUERY DomainAssessment -DOMAINS "domain1.com","domain2.com"
+        Default: All domains if no domains specified in -DOMAINS parameter
+
+    EntityQuery: Query specific entity types
+        Usage: -QUERY EntityQuery <EventType>
+        EventTypes: accountLocked, cloudEnabled, cloudOnly, hasAgedPassword,
+                   hasAgent, hasExposedPassword, hasNeverExpiringPassword,
+                   hasOpenIncidents, hasVulnerableOs, hasWeakPassword,
+                   inactive, learned, marked, shared, stale, unmanaged, watched
+
+    ServiceAccess: Query service access data
+        Usage: -QUERY ServiceAccess [-PROTOCOL <types>] [-SERVICE <types>]
+        Protocols: KERBEROS, LDAP, NTLM, DCE_RPC, SSL, UNKNOWN
+        Services: LDAP, WEB, FILE_SHARE, DB, RPCSS, REMOTE_DESKTOP, SCCM,
+                 SIP, DNS, MAIL, NTLM, COMPUTER_ACCESS, GENERIC_CLOUD,
+                 SERVICE_ACCOUNT, UNKNOWN
+
+EXAMPLES:
+    # Run manual mode with pre-set credentials
+    ./script.ps1 -API_ID "your_id" -REGION "US-1"
+
+    # Run domain assessment for specific domains
+    ./script.ps1 -API_ID "your_id" -API_SECRET "your_secret" -REGION "US-1" `
+                -QUERY "DomainAssessment" -DOMAINS "domain1.com","domain2.com"
+
+    # Run entity query for locked accounts
+    ./script.ps1 -API_ID "your_id" -API_SECRET "your_secret" -REGION "US-1" `
+                -QUERY "EntityQuery" "accountLocked"
+
+    # Run service access query with specific protocols and services
+    ./script.ps1 -API_ID "your_id" -API_SECRET "your_secret" -REGION "US-1" `
+                -QUERY "ServiceAccess" -PROTOCOL "NTLM","KERBEROS" -SERVICE "WEB","FILE_SHARE"
+
+    # Schedule execution every 3 hours, repeat 5 times
+    ./script.ps1 -API_ID "your_id" -API_SECRET "your_secret" -REGION "US-1" `
+                -QUERY "DomainAssessment" -DOMAINS "domain1.com" -SCHEDULE "3h" -REPEAT 5
+
+NOTE: API_SECRET can be omitted from command line for security. If not provided,
+      you will be prompted to enter it securely.
+"@
+    Write-Host $helpText
+    exit 0
+}
+
+#-------------------------------------------------------------------------
+# Clear Function
+#-------------------------------------------------------------------------
+function clearAll {	
+    # Clear variables in all scopes
+    Get-Variable -Scope Global | Where-Object { 
+        $_.Options -notmatch "ReadOnly|Constant|AllScope" -and 
+        $_.Name -notmatch "^(?:PWD|PSCommandPath|PSScriptRoot|MyInvocation)$"
+    } | Remove-Variable -Force -ErrorAction SilentlyContinue
+
+    # Clear specific scopes
+    Get-Variable -Scope Script | Remove-Variable -Force -ErrorAction SilentlyContinue
+    Get-Variable -Scope Local | Remove-Variable -Force -ErrorAction SilentlyContinue
+
+    # Clear modules
+    Remove-Module * -Force -ErrorAction SilentlyContinue
+
+    # Clear error variable
+    $error.Clear()
+
+    # Force garbage collection
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+    [System.GC]::Collect()
+    Write-Log "Memory data was cleared" -Level info
+}
 
 #-------------------------------------------------------------------------
 # Logging Function
@@ -184,6 +271,36 @@ function Write-Log {
 }
 
 #-------------------------------------------------------------------------
+# Schedule Parser
+#-------------------------------------------------------------------------
+function Parse-Schedule {
+    param (
+        [string]$Schedule
+    )
+    
+    if (-not $Schedule) {
+        return $null
+    }
+    
+    $match = $Schedule -match '(\d+)([mhd])'
+    if (-not $match) {
+        Write-Log "Invalid schedule format. Use format: <number><unit> (e.g., 3m, 2h, 1d)" -Level Error
+        exit 1
+    }
+    
+    $value = [int]$matches[1]
+    $unit = $matches[2]
+    
+    $minutes = switch ($unit) {
+        'm' { $value }
+        'h' { $value * 60 }
+        'd' { $value * 1440 }
+    }
+    
+    return $minutes
+}
+
+#-------------------------------------------------------------------------
 # CrowdStrike Region Configuration
 #-------------------------------------------------------------------------
 function Initialize-CrowdStrikeRegions {
@@ -191,8 +308,36 @@ function Initialize-CrowdStrikeRegions {
         '1' = @{ Name = 'US-1'; Url = 'https://api.crowdstrike.com' }
         '2' = @{ Name = 'US-2'; Url = 'https://api.us-2.crowdstrike.com' }
         '3' = @{ Name = 'EU-1'; Url = 'https://api.eu-1.crowdstrike.com' }
-        '4' = @{ Name = 'US-GOV-1'; Url = 'https://api.laggar.gcw.crowdstrike.com' }
+        '4' = @{ Name = 'GOV-1'; Url = 'https://api.laggar.gcw.crowdstrike.com' }
     }
+}
+
+#-------------------------------------------------------------------------
+# Region Selection
+#-------------------------------------------------------------------------
+function Get-UserRegionSelection {
+    param (
+        [hashtable]$Regions
+    )
+    
+    Write-Log "Starting region selection process"
+    Write-Host "`nSelect a CrowdStrike API region:" -ForegroundColor Cyan
+    
+    $SortedKeys = $Regions.Keys | Sort-Object
+    foreach ($Key in $SortedKeys) {
+        Write-Host "$Key. $($Regions[$Key].Name)"
+    }
+    
+    do {
+        $RegionChoice = Read-Host "`nEnter the number corresponding to your region"
+        if (-not $Regions.ContainsKey($RegionChoice)) {
+            Write-Log "Invalid region selection: $RegionChoice" -Level Warning
+            Write-Host "Invalid selection. Please try again." -ForegroundColor Yellow
+        }
+    } while (-not $Regions.ContainsKey($RegionChoice))
+    
+    Write-Log "Selected region: $($Regions[$RegionChoice].Name)"
+    return $Regions[$RegionChoice]
 }
 
 #-------------------------------------------------------------------------
@@ -201,30 +346,26 @@ function Initialize-CrowdStrikeRegions {
 function Get-CrowdStrikeToken {
     param (
         [string]$BaseUrl,
-        [string]$ProvidedApiId,
-        [string]$ProvidedApiSecret
+        [string]$ApiClientId,
+        [string]$ApiClientSecret
     )
     
     try {
-        if ([string]::IsNullOrEmpty($ProvidedApiId)) {
+        if (-not $ApiClientId) {
             $ApiClientId = Read-Host "Enter your API Client ID"
-        } else {
-            $ApiClientId = $ProvidedApiId
         }
         
-        if ([string]::IsNullOrEmpty($ProvidedApiSecret)) {
-            $ApiClientSecret = Read-Host "Enter your API Client Secret" -AsSecureString
-            $ApiClientSecretPlainText = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ApiClientSecret)
+        if (-not $ApiClientSecret) {
+            $ApiClientSecretSecure = Read-Host "Enter your API Client Secret" -AsSecureString
+            $ApiClientSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ApiClientSecretSecure)
             )
-        } else {
-            $ApiClientSecretPlainText = $ProvidedApiSecret
         }
         
         Write-Log "Attempting to obtain OAuth2 token"
         $TokenResponse = Invoke-RestMethod -Method POST -Uri "$BaseUrl/oauth2/token" -Headers @{
             'Content-Type' = 'application/x-www-form-urlencoded'
-        } -Body "client_id=$ApiClientId&client_secret=$ApiClientSecretPlainText"
+        } -Body "client_id=$ApiClientId&client_secret=$ApiClientSecret"
         
         if (-not $TokenResponse.access_token) {
             throw "No access token received in response"
@@ -240,8 +381,145 @@ function Get-CrowdStrikeToken {
     finally {
         # Clear sensitive data from memory
         $ApiClientSecret = $null
-        $ApiClientSecretPlainText = $null
+        $ApiClientSecretSecure = $null
         [System.GC]::Collect()
+    }
+}
+
+#-------------------------------------------------------------------------
+# Domain List Retrieval
+#-------------------------------------------------------------------------
+function Get-DomainList {
+    param (
+        [string]$BaseUrl,
+        [string]$AccessToken
+    )
+    
+    try {
+        Write-Log "Fetching domain list"
+        
+        $GraphQLQuery = @"
+{
+    domains(dataSources: [])
+}
+"@
+        
+        $GraphQLResponse = Invoke-RestMethod -Method POST -Uri "$BaseUrl/identity-protection/combined/graphql/v1" `
+            -Headers @{
+                'Authorization' = "Bearer $AccessToken"
+                'Content-Type' = 'application/json'
+            } `
+            -Body (@{ query = $GraphQLQuery } | ConvertTo-Json)
+        
+        if (-not $GraphQLResponse.data.domains) {
+            Write-Log "No domains returned from API" -Level Warning
+            return @()
+        }
+        
+        Write-Log "Successfully retrieved domain list"
+        return $GraphQLResponse.data.domains
+    }
+    catch {
+        Write-Log "Error fetching domain list: $_" -Level Error
+        throw
+    }
+}
+
+#-------------------------------------------------------------------------
+# Security Assessment
+#-------------------------------------------------------------------------
+function Get-SecurityAssessment {
+    param (
+        [string]$Domain,
+        [string]$BaseUrl,
+        [string]$AccessToken
+    )
+    
+    try {
+        Write-Log "Querying security assessment for domain: $Domain"
+        
+        $GraphQLQuery = @"
+{
+    securityAssessment(domain: "$Domain") {
+        overallScore
+        overallScoreLevel
+        assessmentFactors {
+            riskFactorType
+            severity
+            likelihood
+        }
+    }
+}
+"@
+        
+        $GraphQLResponse = Invoke-RestMethod -Method POST -Uri "$BaseUrl/identity-protection/combined/graphql/v1" `
+            -Headers @{
+                'Authorization' = "Bearer $AccessToken"
+                'Content-Type' = 'application/json'
+            } `
+            -Body (@{ query = $GraphQLQuery } | ConvertTo-Json -Depth 3)
+        
+        if (-not $GraphQLResponse.data) {
+            Write-Log "No data returned for domain: $Domain" -Level Warning
+            return $null
+        }
+        
+        return $GraphQLResponse.data.securityAssessment
+    }
+    catch {
+        Write-Log "Error querying domain $Domain`: $_" -Level Error
+        return $null
+    }
+}
+
+#-------------------------------------------------------------------------
+# Entity Query
+#-------------------------------------------------------------------------
+function Get-EntityData {
+    param (
+        [string]$BaseUrl,
+        [string]$AccessToken,
+        [string]$QueryParameter,
+        [string]$AfterCursor = $null
+    )
+    
+    try {
+        $GraphQLQuery = @"
+{
+    entities(
+        $QueryParameter
+        archived: false
+        first: 1000
+        $(if($AfterCursor){"after: `"$AfterCursor`""})
+    ) {
+        pageInfo {
+            hasNextPage
+            endCursor
+        }
+        nodes {
+            primaryDisplayName
+            secondaryDisplayName
+            isHuman: hasRole(type: HumanUserAccountRole)
+            isProgrammatic: hasRole(type: ProgrammaticUserAccountRole)
+            riskScore
+            riskScoreSeverity
+        }
+    }
+}
+"@
+        
+        $GraphQLResponse = Invoke-RestMethod -Method POST -Uri "$BaseUrl/identity-protection/combined/graphql/v1" `
+            -Headers @{
+                'Authorization' = "Bearer $AccessToken"
+                'Content-Type' = 'application/json'
+            } `
+            -Body (@{ query = $GraphQLQuery } | ConvertTo-Json -Depth 3)
+        
+        return $GraphQLResponse.data.entities
+    }
+    catch {
+        Write-Log "Error querying entities: $_" -Level Error
+        return $null
     }
 }
 
@@ -254,8 +532,7 @@ function Get-ServiceAccessData {
         [string]$AccessToken,
         [string[]]$SelectedProtocols,
         [string[]]$SelectedServices,
-        [string]$BeforeCursor = $null,
-        [int]$PageSize = 1000
+        [string]$StartCursor = $null
     )
     
     try {
@@ -278,12 +555,13 @@ function Get-ServiceAccessData {
     timeline(
         types: [SERVICE_ACCESS]
         activityQuery: { $filterPart }
-        last: $PageSize
-        $(if($BeforeCursor){"before: `"$BeforeCursor`""})
+        first: 1000
+        sortOrder: DESCENDING
+        $(if($StartCursor){"after: `"$StartCursor`""})
     ) {
         pageInfo {
-            hasPreviousPage
-            startCursor
+            hasNextPage
+            endCursor
         }
         nodes {
             timestamp
@@ -313,7 +591,7 @@ function Get-ServiceAccessData {
             } `
             -Body (@{ query = $GraphQLQuery } | ConvertTo-Json -Depth 10)
 
-        $result = @{
+        return @{
             Data = $Response.data.timeline.nodes | ForEach-Object {
                 [PSCustomObject]@{
                     Timestamp = [DateTime]$_.timestamp
@@ -328,8 +606,6 @@ function Get-ServiceAccessData {
             }
             PageInfo = $Response.data.timeline.pageInfo
         }
-        
-        return $result
     }
     catch {
         Write-Log "Error executing service access query: $_" -Level Error
@@ -338,93 +614,368 @@ function Get-ServiceAccessData {
 }
 
 #-------------------------------------------------------------------------
-# Domain Risks Data
+# Automated Execution Function
 #-------------------------------------------------------------------------
-function Get-DomainRisksData {
+function Start-AutomatedExecution {
     param (
         [string]$BaseUrl,
         [string]$AccessToken,
-        [string]$Domain,
-        [int]$MinRiskScore = 0
+        [string]$Query,
+        [string[]]$QueryParams,
+        [string[]]$Protocols,
+        [string[]]$Services,
+        [string[]]$SpecificDomains
     )
     
-    try {
-        Write-Log "Executing domain risks query for domain: $Domain"
-        
-        $GraphQLQuery = @"
-{
-    domainRisks(domain: "$Domain") {
-        riskScore
-        riskFactors {
-            category
-            description
-            severity
+    switch ($Query) {
+        'DomainAssessment' {
+            # Use specific domains if provided, otherwise get all domains
+            $domains = if ($SpecificDomains) {
+                Write-Log "Using specified domains: $($SpecificDomains -join ', ')"
+                $SpecificDomains
+            } else {
+                Write-Log "No specific domains provided, fetching all domains"
+                Get-DomainList -BaseUrl $BaseUrl -AccessToken $AccessToken
+            }
+            
+            $Data = @()
+            foreach ($Domain in $domains) {
+                $Assessment = Get-SecurityAssessment -Domain $Domain -BaseUrl $BaseUrl -AccessToken $AccessToken
+                if ($Assessment) {
+                    foreach ($Factor in $Assessment.assessmentFactors) {
+                        $Data += [PSCustomObject]@{
+                            Domain = $Domain
+                            RiskFactorType = $Factor.riskFactorType
+                            Severity = $Factor.severity
+                            Likelihood = $Factor.likelihood
+                            OverallScore = $Assessment.overallScore
+                            OverallScoreLevel = $Assessment.overallScoreLevel
+                        }
+                    }
+                }
+            }
+            
+            if ($Data.Count -gt 0) {
+                $OutputPath = Join-Path $ScriptDirectory "Output"
+                Export-AssessmentData -Data $Data -OutputPath $OutputPath -FilePrefix "DomainRisks"
+            }
         }
-        domainInfo {
-            registrar
-            creation
-            expiration
-            lastUpdate
-        }
-    }
-}
-"@
         
-        $Response = Invoke-RestMethod -Method POST -Uri "$BaseUrl/identity-protection/combined/graphql/v1" `
-            -Headers @{
-                'Authorization' = "Bearer $AccessToken"
-                'Content-Type' = 'application/json'
-            } `
-            -Body (@{ query = $GraphQLQuery } | ConvertTo-Json)
-
-        return $Response.data.domainRisks
-    }
-    catch {
-        Write-Log "Error executing domain risks query: $_" -Level Error
-        throw
+        'EntityQuery' {
+            if (-not $QueryParams) {
+                Write-Log "Entity type must be specified for EntityQuery" -Level Error
+                exit 1
+            }
+            
+            $validTypes = @('accountLocked', 'cloudEnabled', 'cloudOnly', 'hasAgedPassword',
+                           'hasAgent', 'hasExposedPassword', 'hasNeverExpiringPassword',
+                           'hasOpenIncidents', 'hasVulnerableOs', 'hasWeakPassword',
+                           'inactive', 'learned', 'marked', 'shared', 'stale', 'unmanaged',
+                           'watched')
+            
+            if ($validTypes -notcontains $QueryParams[0]) {
+                Write-Log "Invalid entity type specified. Valid types: $($validTypes -join ', ')" -Level Error
+                exit 1
+            }
+            
+            $Data = @()
+            $hasNextPage = $true
+            $afterCursor = $null
+            
+            while ($hasNextPage) {
+                $QueryParam = "$($QueryParams[0]):true"
+                $Response = Get-EntityData -BaseUrl $BaseUrl -AccessToken $AccessToken -QueryParameter $QueryParam -AfterCursor $afterCursor
+                
+                if ($Response) {
+                    $Data += $Response.nodes
+                    $hasNextPage = $Response.pageInfo.hasNextPage
+                    $afterCursor = $Response.pageInfo.endCursor
+                }
+                else {
+                    $hasNextPage = $false
+                }
+                Start-Sleep -Milliseconds 100
+            }
+            
+            if ($Data.Count -gt 0) {
+                $OutputPath = Join-Path $ScriptDirectory "Output"
+                Export-AssessmentData -Data $Data -OutputPath $OutputPath -FilePrefix "EntityQuery_$($QueryParams[0])"
+            }
+        }
+        
+        'ServiceAccess' {
+            $selectedProtocols = if ($Protocols) { $Protocols } else { $PROTOCOL_TYPES }
+            $selectedServices = if ($Services) { $Services } else { $SERVICE_TYPES }
+            
+            $allData = @()
+            $hasNextPage = $true
+            $endCursor = $null
+            $totalRecords = 0
+            
+            while ($hasNextPage -and $totalRecords -lt 1000) {
+                $results = Get-ServiceAccessData -BaseUrl $BaseUrl -AccessToken $AccessToken `
+                    -SelectedProtocols $selectedProtocols -SelectedServices $selectedServices `
+                    -StartCursor $endCursor
+                
+                if ($results.Data) {
+                    $allData += $results.Data
+                    $totalRecords = $allData.Count
+                    $hasNextPage = $results.PageInfo.hasNextPage
+                    $endCursor = $results.PageInfo.endCursor
+                }
+                else {
+                    $hasNextPage = $false
+                }
+                Start-Sleep -Milliseconds 100
+            }
+            
+            if ($allData.Count -gt 0) {
+                $OutputPath = Join-Path $ScriptDirectory "Output"
+                Export-AssessmentData -Data $allData -OutputPath $OutputPath -FilePrefix "ServiceAccess"
+            }
+        }
     }
 }
 
 #-------------------------------------------------------------------------
-# Entity Query
+# Menu Functions
 #-------------------------------------------------------------------------
-function Get-EntityData {
+function Show-ServiceAccessMenu {
     param (
         [string]$BaseUrl,
-        [string]$AccessToken,
-        [string]$Type,
-        [string]$Query
+        [string]$AccessToken
     )
     
-    try {
-        Write-Log "Executing entity query of type $Type with query: $Query"
-        
-        $GraphQLQuery = @"
-{
-    entitySearch(type: $Type, query: "$Query") {
-        nodes {
-            id
-            type
-            primaryDisplayName
-            secondaryDisplayName
-            properties
+    Write-Host "`nService Access Query Configuration" -ForegroundColor Cyan
+    
+    # Protocol Selection
+    Write-Host "`nStep 1: Select Protocol Types" -ForegroundColor Yellow
+    Write-Host "Protocol Types (leave empty for all):"
+    for ($i = 0; $i -lt $PROTOCOL_TYPES.Count; $i++) {
+        Write-Host "$($i + 1). $($PROTOCOL_TYPES[$i])"
+    }
+    $protocolChoice = Read-Host "`nEnter protocol numbers (space-separated) or press Enter for all"
+    
+    # Service Type Selection
+    Write-Host "`nStep 2: Select Service Types" -ForegroundColor Yellow
+    Write-Host "Service Types (leave empty for all):"
+    for ($i = 0; $i -lt $SERVICE_TYPES.Count; $i++) {
+        Write-Host "$($i + 1). $($SERVICE_TYPES[$i])"
+    }
+    $serviceChoice = Read-Host "`nEnter service type numbers (space-separated) or press Enter for all"
+    
+    # Record Limit Selection
+    Write-Host "`nStep 3: Select Number of Records to Fetch" -ForegroundColor Yellow
+    Write-Host "1. 1,000 records"
+    Write-Host "2. 5,000 records"
+    Write-Host "3. 10,000 records"
+    Write-Host "4. 50,000 records"
+    Write-Host "5. 100,000 records"
+    Write-Host "6. Custom number"
+    
+    $recordChoice = Read-Host "`nEnter your choice (1-6)"
+    $recordLimit = switch ($recordChoice) {
+        "1" { 1000 }
+        "2" { 5000 }
+        "3" { 10000 }
+        "4" { 50000 }
+        "5" { 100000 }
+        "6" {
+            $customLimit = Read-Host "Enter custom number (will be rounded to nearest 1000)"
+            [math]::Ceiling([int]$customLimit / 1000) * 1000
+        }
+        default { 1000 } # Default to 1000 if invalid input
+    }
+    
+    Write-Host "`nFetching $recordLimit records..." -ForegroundColor Cyan
+    
+    $selectedProtocols = @()
+    if ($protocolChoice -ne '') {
+        $selectedProtocols = $protocolChoice.Split(' ') | ForEach-Object {
+            $index = [int]$_ - 1
+            if ($index -ge 0 -and $index -lt $PROTOCOL_TYPES.Count) {
+                $PROTOCOL_TYPES[$index]
+            }
         }
     }
-}
-"@
-        
-        $Response = Invoke-RestMethod -Method POST -Uri "$BaseUrl/identity-protection/combined/graphql/v1" `
-            -Headers @{
-                'Authorization' = "Bearer $AccessToken"
-                'Content-Type' = 'application/json'
-            } `
-            -Body (@{ query = $GraphQLQuery } | ConvertTo-Json)
-
-        return $Response.data.entitySearch.nodes
+    
+    $selectedServices = @()
+    if ($serviceChoice -ne '') {
+        $selectedServices = $serviceChoice.Split(' ') | ForEach-Object {
+            $index = [int]$_ - 1
+            if ($index -ge 0 -and $index -lt $SERVICE_TYPES.Count) {
+                $SERVICE_TYPES[$index]
+            }
+        }
     }
-    catch {
-        Write-Log "Error executing entity query: $_" -Level Error
-        throw
+    
+    $allData = @()
+    $hasNextPage = $true
+    $endCursor = $null
+    $totalRecords = 0
+    $pageCount = 1
+
+    Write-Host "`nFetching service access data..."
+    while ($hasNextPage -and $totalRecords -lt $recordLimit) {
+        Write-Host "Processing page $pageCount... ($totalRecords / $recordLimit records)"
+        $results = Get-ServiceAccessData -BaseUrl $BaseUrl -AccessToken $AccessToken `
+            -SelectedProtocols $selectedProtocols -SelectedServices $selectedServices `
+            -StartCursor $endCursor
+
+        if ($results.Data) {
+            $allData += $results.Data
+            $totalRecords = $allData.Count
+            $hasNextPage = $results.PageInfo.hasNextPage
+            $endCursor = $results.PageInfo.endCursor
+            $pageCount++
+        }
+        else {
+            $hasNextPage = $false
+        }
+        Start-Sleep -Milliseconds 100  # Rate limiting
+    }
+
+    Write-Host "Total records processed: $totalRecords"
+    
+    if ($allData.Count -gt 0) {
+        $OutputPath = Join-Path $ScriptDirectory "Output"
+        Export-AssessmentData -Data $allData -OutputPath $OutputPath -FilePrefix "ServiceAccess"
+    }
+    else {
+        Write-Log "No service access data found for the selected criteria" -Level Warning
+    }
+}
+
+function Show-DomainAssessmentMenu {
+    param (
+        [string]$BaseUrl,
+        [string]$AccessToken
+    )
+    
+    $domains = Get-DomainList -BaseUrl $BaseUrl -AccessToken $AccessToken
+    
+    Write-Host "`nAvailable Domains (leave empty for all):" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $domains.Count; $i++) {
+        Write-Host "$($i + 1). $($domains[$i])"
+    }
+    
+    $domainChoice = Read-Host "`nEnter domain numbers (space-separated) or press Enter for all"
+    
+    $selectedDomains = @()
+    if ($domainChoice -eq '') {
+        $selectedDomains = $domains
+    }
+    else {
+        $selectedDomains = $domainChoice.Split(' ') | ForEach-Object {
+            $index = [int]$_ - 1
+            if ($index -ge 0 -and $index -lt $domains.Count) {
+                $domains[$index]
+            }
+        }
+    }
+    
+    $Data = @()
+    foreach ($Domain in $selectedDomains) {
+        $Assessment = Get-SecurityAssessment -Domain $Domain -BaseUrl $BaseUrl -AccessToken $AccessToken
+        
+        if ($Assessment) {
+            foreach ($Factor in $Assessment.assessmentFactors) {
+                $Data += [PSCustomObject]@{
+                    Domain = $Domain
+                    RiskFactorType = $Factor.riskFactorType
+                    Severity = $Factor.severity
+                    Likelihood = $Factor.likelihood
+                    OverallScore = $Assessment.overallScore
+                    OverallScoreLevel = $Assessment.overallScoreLevel
+                }
+            }
+        }
+    }
+    
+    if ($Data.Count -gt 0) {
+        $SortedData = $Data | Sort-Object -Property Domain, Severity
+        $OutputPath = Join-Path $ScriptDirectory "Output"
+        Export-AssessmentData -Data $SortedData -OutputPath $OutputPath -FilePrefix "DomainRisks"
+    }
+    else {
+        Write-Log "No assessment data was collected" -Level Warning
+    }
+}
+
+function Show-EntityQueryMenu {
+    param (
+        [string]$BaseUrl,
+        [string]$AccessToken
+    )
+    
+    $menuOptions = @{
+        1 = @{ 'Parameter' = 'accountLocked'; 'Description' = 'Find locked accounts' }
+        2 = @{ 'Parameter' = 'cloudEnabled'; 'Description' = 'Find accounts with SSO enabled' }
+        3 = @{ 'Parameter' = 'cloudOnly'; 'Description' = 'Find cloud-only accounts' }
+        4 = @{ 'Parameter' = 'hasAgedPassword'; 'Description' = 'Find accounts with old passwords' }
+        5 = @{ 'Parameter' = 'hasAgent'; 'Description' = 'Find accounts with Falcon sensor' }
+        6 = @{ 'Parameter' = 'hasExposedPassword'; 'Description' = 'Find accounts with exposed passwords' }
+        7 = @{ 'Parameter' = 'hasNeverExpiringPassword'; 'Description' = 'Find accounts with non-expiring passwords' }
+        8 = @{ 'Parameter' = 'hasOpenIncidents'; 'Description' = 'Find accounts with open incidents' }
+        9 = @{ 'Parameter' = 'hasVulnerableOs'; 'Description' = 'Find endpoints with vulnerable OS' }
+        10 = @{ 'Parameter' = 'hasWeakPassword'; 'Description' = 'Find accounts with weak passwords' }
+        11 = @{ 'Parameter' = 'inactive'; 'Description' = 'Find inactive accounts' }
+        12 = @{ 'Parameter' = 'learned'; 'Description' = 'Find learned entities' }
+        13 = @{ 'Parameter' = 'marked'; 'Description' = 'Find marked entities' }
+        14 = @{ 'Parameter' = 'shared'; 'Description' = 'Find shared accounts' }
+        15 = @{ 'Parameter' = 'stale'; 'Description' = 'Find stale accounts' }
+        16 = @{ 'Parameter' = 'unmanaged'; 'Description' = 'Find unmanaged endpoints' }
+        17 = @{ 'Parameter' = 'watched'; 'Description' = 'Find watched entities' }
+    }
+    
+    Write-Host "`nEntity Query Options:" -ForegroundColor Cyan
+    foreach ($key in $menuOptions.Keys | Sort-Object) {
+        Write-Host "$key. $($menuOptions[$key].Description)"
+    }
+    Write-Host "18. Exit to Main Menu"
+        
+    $choice = Read-Host "`nEnter your choice (1-18)"
+        
+    if ($choice -eq '18') {
+        return
+    }
+    elseif ($menuOptions.ContainsKey([int]$choice)) {
+        $selectedOption = $menuOptions[[int]$choice]
+        Write-Host "Processing query: $($selectedOption.Description)"
+            
+        $Data = @()
+        $hasNextPage = $true
+        $afterCursor = $null
+        $pageCount = 1
+            
+        Write-Host "Fetching entities..."
+        while ($hasNextPage) {
+            Write-Host "Processing page $pageCount"
+            $QueryParam = "$($selectedOption.Parameter):true"
+            $Response = Get-EntityData -BaseUrl $BaseUrl -AccessToken $AccessToken -QueryParameter $QueryParam -AfterCursor $afterCursor
+                
+            if ($Response) {
+                $Data += $Response.nodes
+                $hasNextPage = $Response.pageInfo.hasNextPage
+                $afterCursor = $Response.pageInfo.endCursor
+                $pageCount++
+            }
+            else {
+                $hasNextPage = $false
+            }
+            Start-Sleep -Milliseconds 100
+        }
+            
+        if ($Data.Count -eq 0) {
+            Write-Log "No entities found for the selected query" -Level Warning
+        }
+        else {
+            $OutputPath = Join-Path $ScriptDirectory "Output"
+            Export-AssessmentData -Data $Data -OutputPath $OutputPath -FilePrefix "EntityQuery_$($selectedOption.Parameter)"
+        }
+    }
+    else {
+        Write-Host "Invalid choice. Please try again." -ForegroundColor Yellow
     }
 }
 
@@ -433,32 +984,26 @@ function Get-EntityData {
 #-------------------------------------------------------------------------
 function Export-AssessmentData {
     param (
-        [Parameter(Mandatory=$true)]
-        [object[]]$Data,
-        
-        [Parameter(Mandatory=$true)]
+        [Array]$Data,
         [string]$OutputPath,
-        
-        [Parameter(Mandatory=$true)]
         [string]$FilePrefix
     )
     
     try {
-        if (-not (Test-Path -Path $OutputPath)) {
+        if (-not (Test-Path $OutputPath)) {
             New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
         }
         
-        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $csvPath = Join-Path -Path $OutputPath -ChildPath "${FilePrefix}_${timestamp}.csv"
-        $jsonPath = Join-Path -Path $OutputPath -ChildPath "${FilePrefix}_${timestamp}.json"
+        $CsvPath = Join-Path $OutputPath "${FilePrefix}_$(Get-Date -Format 'ddMMyyyy_HHmmss').csv"
+        $Data | ConvertTo-Csv -NoTypeInformation | ForEach-Object {
+            [System.Text.Encoding]::UTF8.GetBytes("$_`r`n")
+        } | Set-Content -Path $CsvPath -Encoding Byte
+        Write-Log "Successfully exported CSV to: $CsvPath"
         
-        # Export to CSV
-        $Data | Export-Csv -Path $csvPath -NoTypeInformation
-        Write-Log "Data exported to CSV: $csvPath"
-        
-        # Export to JSON
-        $Data | ConvertTo-Json -Depth 10 | Out-File -FilePath $jsonPath
-        Write-Log "Data exported to JSON: $jsonPath"
+        $JsonPath = Join-Path $OutputPath "${FilePrefix}_$(Get-Date -Format 'ddMMyyyy_HHmmss').json"
+        $JsonContent = $Data | ConvertTo-Json -Depth 3
+        [System.IO.File]::WriteAllText($JsonPath, $JsonContent, [System.Text.Encoding]::UTF8)
+        Write-Log "Successfully exported JSON to: $JsonPath"
     }
     catch {
         Write-Log "Error exporting data: $_" -Level Error
@@ -467,197 +1012,108 @@ function Export-AssessmentData {
 }
 
 #-------------------------------------------------------------------------
-# Scheduling Functions
-#-------------------------------------------------------------------------
-function Convert-ScheduleToMinutes {
-    param (
-        [string]$Schedule
-    )
-    
-    if ([string]::IsNullOrEmpty($Schedule)) {
-        return 0
-    }
-
-    $value = [int]($Schedule -replace '[mhdw]','')
-    $unit = $Schedule[-1]
-    
-    switch ($unit) {
-        'm' { return $value }
-        'h' { return $value * 60 }
-        'd' { return $value * 1440 }
-        'w' { return $value * 10080 }
-        default { throw "Invalid schedule format" }
-    }
-}
-
-function Validate-QueryParameters {
-    # If no QueryType is specified, assume interactive mode
-    if (-not $QueryType) {
-        return $true
-    }
-
-    # Validate automated mode parameters
-    switch ($QueryType) {
-        'ServiceAccess' {
-            if (-not $FetchSize) {
-                Write-Log "FetchSize parameter is required for ServiceAccess query" -Level Error
-                return $false
-            }
-        }
-        'DomainRisks' {
-            if (-not $DomainName) {
-                Write-Log "DomainName parameter is required for DomainRisks query" -Level Error
-                return $false
-            }
-        }
-        'Entities' {
-            if (-not $EntityType -or -not $SearchQuery) {
-                Write-Log "EntityType and SearchQuery parameters are required for Entities query" -Level Error
-                return $false
-            }
-        }
-    }
-    return $true
-}
-
-function Execute-ScheduledTask {
-    param (
-        [string]$BaseUrl,
-        [string]$AccessToken
-    )
-
-    # Create Output directory if it doesn't exist
-    $OutputPath = Join-Path $ScriptDirectory "Output"
-    if (-not (Test-Path -Path $OutputPath)) {
-        New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
-    }
-
-    switch ($QueryType) {
-        'ServiceAccess' {
-            $results = Get-ServiceAccessData -BaseUrl $BaseUrl -AccessToken $AccessToken `
-                -SelectedProtocols $Protocols -SelectedServices $Services `
-                -PageSize $FetchSize
-            if ($results.Data.Count -gt 0) {
-                Export-AssessmentData -Data $results.Data -OutputPath $OutputPath -FilePrefix "ServiceAccess"
-            }
-        }
-        'DomainRisks' {
-            $results = Get-DomainRisksData -BaseUrl $BaseUrl -AccessToken $AccessToken `
-                -Domain $DomainName -MinRiskScore $RiskScore
-            if ($results) {
-                Export-AssessmentData -Data $results -OutputPath $OutputPath -FilePrefix "DomainRisks"
-            }
-        }
-        'Entities' {
-            $results = Get-EntityData -BaseUrl $BaseUrl -AccessToken $AccessToken `
-                -Type $EntityType -Query $SearchQuery
-            if ($results) {
-                Export-AssessmentData -Data $results -OutputPath $OutputPath -FilePrefix "Entities"
-            }
-        }
-    }
-}
-
-#-------------------------------------------------------------------------
 # Main Execution Block
 #-------------------------------------------------------------------------
+ClearAll
+Clear-Host
+
 try {
     Write-Log "Script execution started"
     
-    if (-not (Validate-QueryParameters)) {
-        exit 1
+    if ($HELP) {
+        Show-Help
     }
-
-    $scheduleMinutes = Convert-ScheduleToMinutes -Schedule $Schedule
-    $runCount = 0
     
-    do {
-        Write-Log "Starting execution run #$($runCount + 1)"
-        
-        # Get and display external IP
-        $externalIP = Get-ExternalIPAddress
-        if ($externalIP) {
-            Write-Log "External IP Address: $externalIP"
+    $Regions = Initialize-CrowdStrikeRegions
+    $regionMap = @{
+        'US-1' = '1'
+        'US-2' = '2'
+        'EU-1' = '3'
+        'GOV-1' = '4'
+    }
+    
+    # Handle Region Selection with validation
+    if ($REGION) {
+        if (-not $regionMap.ContainsKey($REGION)) {
+            Write-Log "Invalid region specified: $REGION" -Level Error
+            Write-Host "Valid regions are: $($regionMap.Keys -join ', ')" -ForegroundColor Red
+            exit 1
         }
-        
-        $Regions = Initialize-CrowdStrikeRegions
-        
-        # Handle region selection - either from parameter or user input
-        if ($REGION) {
-            $regionMapping = @{
-                'US-1' = '1'
-                'US-2' = '2'
-                'EU-1' = '3'
-                'US-GOV-1' = '4'
-            }
-            
-            $regionKey = $regionMapping[$REGION]
-            $SelectedRegion = $Regions[$regionKey]
-            Write-Log "Using region: $REGION"
-        } else {
-            $SelectedRegion = Get-UserRegionSelection -Regions $Regions
-        }
-        
-        $AccessToken = Get-CrowdStrikeToken -BaseUrl $SelectedRegion.Url -ProvidedApiId $API_ID -ProvidedApiSecret $API_SECRET
-        
-        # Check if running in automated or interactive mode
-        if ($QueryType) {
-            # Automated mode with command line parameters
-            Execute-ScheduledTask -BaseUrl $SelectedRegion.Url -AccessToken $AccessToken
-        } else {
-            # Interactive mode with menu
-            do {
-                Write-Host "`nSelect an option:" -ForegroundColor Cyan
-                Write-Host "1. Domain Risks Assessment"
-                Write-Host "2. Entities Query"
-                Write-Host "3. Service Access Query"
-                Write-Host "4. Exit"
-                
-                $choice = Read-Host "`nEnter your choice (1-4)"
-                
-                switch ($choice) {
-                    "1" {
-                        Show-DomainAssessmentMenu -BaseUrl $SelectedRegion.Url -AccessToken $AccessToken
-                    }
-                    "2" {
-                        Show-EntityQueryMenu -BaseUrl $SelectedRegion.Url -AccessToken $AccessToken
-                    }
-                    "3" {
-                        Show-ServiceAccessMenu -BaseUrl $SelectedRegion.Url -AccessToken $AccessToken
-                    }
-                    "4" {
-                        Write-Log "Script execution ended by user"
-                        exit 0
-                    }
-                    default {
-                        Write-Host "Invalid choice. Please try again." -ForegroundColor Yellow
-                    }
+        $regionChoice = $regionMap[$REGION]
+        $SelectedRegion = $Regions[$regionChoice]
+    }
+    else {
+        $SelectedRegion = Get-UserRegionSelection -Regions $Regions
+    }
+    
+    # Handle Authentication with better error handling
+    if ($API_ID) {
+        if (-not $API_SECRET) {
+            try {
+                $secureSecret = Read-Host "Enter your API Client Secret" -AsSecureString
+                $API_SECRET = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                    [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureSecret)
+                )
+                if ([string]::IsNullOrWhiteSpace($API_SECRET)) {
+                    throw "API Secret cannot be empty"
                 }
-            } while ($true)
+            }
+            catch {
+                Write-Log "Failed to securely read API Secret: $_" -Level Error
+                exit 1
+            }
         }
-        
-        $runCount++
-        
-        # Check if we've hit the run limit (only applies to automated mode)
-        if ($RunLimit -gt 0 -and $runCount -ge $RunLimit) {
-            Write-Log "Reached run limit of $RunLimit. Exiting."
-            break
-        }
-        
-        # If scheduled, wait for next run (only applies to automated mode)
-        if ($scheduleMinutes -gt 0) {
-            Write-Log "Waiting $scheduleMinutes minutes until next run..."
-            Start-Sleep -Seconds ($scheduleMinutes * 60)
-        } else {
-            break
-        }
-        
-    } while ($true)
+        $AccessToken = Get-CrowdStrikeToken -BaseUrl $SelectedRegion.Url -ApiClientId $API_ID -ApiClientSecret $API_SECRET
+    }
+    else {
+        $AccessToken = Get-CrowdStrikeToken -BaseUrl $SelectedRegion.Url
+    }
     
-    Write-Log "Script execution completed successfully"
-    exit 0
+    # Handle Automated or Manual Execution with improved scheduling
+    if ($QUERY) {
+        $scheduleMinutes = if ($SCHEDULE) { Parse-Schedule -Schedule $SCHEDULE } else { 0 }
+        
+        for ($i = 1; $i -le $REPEAT; $i++) {
+            Write-Log "Execution $i of $REPEAT"
+            Start-AutomatedExecution -BaseUrl $SelectedRegion.Url -AccessToken $AccessToken `
+                -Query $QUERY -QueryParams $args -Protocols $PROTOCOL -Services $SERVICE `
+                -SpecificDomains $DOMAINS
+            
+            if ($i -lt $REPEAT -and $scheduleMinutes -gt 0) {
+                Write-Log "Waiting $scheduleMinutes minutes until next execution..."
+                Start-Sleep -Seconds ($scheduleMinutes * 60)
+            }
+        }
+    }
+    else {
+        # Manual menu-driven execution remains the same...
+        do {
+            Write-Host "`nSelect an option:" -ForegroundColor Cyan
+            Write-Host "1. Domain Risks Assessment"
+            Write-Host "2. Entities Query"
+            Write-Host "3. Service Access Query"
+            Write-Host "4. Exit"
+            
+            $choice = Read-Host "`nEnter your choice (1-4)"
+            
+            switch ($choice) {
+                "1" { Show-DomainAssessmentMenu -BaseUrl $SelectedRegion.Url -AccessToken $AccessToken }
+                "2" { Show-EntityQueryMenu -BaseUrl $SelectedRegion.Url -AccessToken $AccessToken }
+                "3" { Show-ServiceAccessMenu -BaseUrl $SelectedRegion.Url -AccessToken $AccessToken }
+                "4" { 
+                    Write-Log "Script execution Exited by user"
+                    clearAll
+                    exit 0 
+                }
+                default { 
+                    Write-Host "Invalid choice. Please select a number between 1 and 4." -ForegroundColor Yellow 
+                }
+            }
+        } while ($true)
+    }
 }
 catch {
     Write-Log "Script execution failed: $_" -Level Error
+    clearAll
     exit 1
 }
