@@ -1012,6 +1012,24 @@ function Export-AssessmentData {
 }
 
 #-------------------------------------------------------------------------
+# Fetching External IPv4
+#-------------------------------------------------------------------------
+function Get-ExternalIPv4 {
+    try {
+        $ipv4Regex = '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+        $externalIP = (Invoke-WebRequest -Uri 'https://api4.ipify.org' -TimeoutSec 5 -UseBasicParsing).Content.Trim()
+        
+        if ([string]::IsNullOrWhiteSpace($externalIP) -or $externalIP -notmatch $ipv4Regex) {
+            throw "Invalid IPv4 response"
+        }
+        return $externalIP
+    }
+    catch {
+        return "Failed to fetch External IP"
+    }
+}
+
+#-------------------------------------------------------------------------
 # Main Execution Block
 #-------------------------------------------------------------------------
 ClearAll
@@ -1019,6 +1037,8 @@ Clear-Host
 
 try {
     Write-Log "Script execution started"
+    $ipv4 = Get-ExternalIPv4
+    Write-Log "Trying to fetch HOst External IP (For API access List): < $ipv4 >"
     
     if ($HELP) {
         Show-Help
